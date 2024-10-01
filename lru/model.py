@@ -23,7 +23,6 @@ def nu_init(key, shape, r_min, r_max, dtype=jnp.float32):
     u = jax.random.uniform(key=key, shape=shape, dtype=dtype)
     return jnp.log(-0.5 * jnp.log(u * (r_max**2 - r_min**2) + r_min**2))
 
-
 def theta_init(key, shape, max_phase, dtype=jnp.float32):
     u = jax.random.uniform(key, shape=shape, dtype=dtype)
     return jnp.log(max_phase * u)
@@ -81,16 +80,23 @@ class LRU(nn.Module):
 
     def __call__(self, inputs):
         """Forward pass of a LRU: h_t+1 = lambda * h_t + B x_t+1, y_t = Re[C h_t + D x_t]"""
-        diag_lambda = jnp.exp(-jnp.exp(self.nu_log) + 1j * jnp.exp(self.theta_log))
-        B_norm = (self.B_re + 1j * self.B_im) * jnp.expand_dims(jnp.exp(self.gamma_log), axis=-1)
-        C = self.C_re + 1j * self.C_im
+        #diag_lambda = jnp.exp(-jnp.exp(self.nu_log) + 1j * jnp.exp(self.theta_log))
+        diag_lambda = jnp.exp(-jnp.exp(self.nu_log))# + 1j * jnp.exp(self.theta_log))
+        #B_norm = (self.B_re + 1j * self.B_im) * jnp.expand_dims(jnp.exp(self.gamma_log), axis=-1)
+        B_norm = self.B_re  * jnp.expand_dims(jnp.exp(self.gamma_log),
+                                              axis=-1)
+        #C = self.C_re + 1j * self.C_im
+        C = self.C_re# + 1j * self.C_im
 
-        Lambda_elements = jnp.repeat(diag_lambda[None, ...], inputs.shape[0], axis=0)
+        Lambda_elements = jnp.repeat(diag_lambda[None, ...],
+                                     inputs.shape[0], axis=0)
         Bu_elements = jax.vmap(lambda u: B_norm @ u)(inputs)
         # Compute hidden states
-        _, hidden_states = parallel_scan(binary_operator_diag, (Lambda_elements, Bu_elements))
+        _, hidden_states = parallel_scan(binary_operator_diag,
+                                         (Lambda_elements, Bu_elements))
         # Use them to compute the output of the module
-        outputs = jax.vmap(lambda h, x: (C @ h).real + self.D * x)(hidden_states, inputs)
+        outputs = jax.vmap(lambda h, x: (C @ h).real + self.D * x)(hidden_states,
+                                                                   inputs)
 
         return outputs
 
@@ -107,23 +113,43 @@ class SequenceLayer(nn.Module):
     def setup(self):
         """Initializes the ssm, layer norm and dropout"""
         self.seq = self.lru()
-        self.out1 = nn.Dense(self.d_model)
-        self.out2 = nn.Dense(self.d_model)
+        self.out1 = nn.Dense(self.d_model, use_bias=False)
+        self.out2 = nn.Dense(self.d_model, use_bias=False)
         if self.norm in ["layer"]:
             self.normalization = nn.LayerNorm()
         else:
             self.normalization = nn.BatchNorm(
-                use_running_average=not self.training, axis_name="batch"
+                use_running_average=not self.training, axis_name="batch",
+                use_bias=False, use_scale=False
             )
-        self.drop = nn.Dropout(self.dropout, broadcast_dims=[0], deterministic=not self.training)
+        self.drop = nn.Dropout(self.dropout, broadcast_dims=[0],
+                               deterministic=not self.training)
+
+#    def __call__(self, inputs):
+#        #x = self.normalization(inputs)  # pre normalization
+#        x = inputs
+#        x = self.seq(x)  # call LRU
+#        x = self.drop(nn.gelu(x))
+#        #x = self.out1(x) * jax.nn.sigmoid(self.out2(x))  # GLU
+#        x = x * jax.nn.sigmoid(self.out1(x))  # GLU our version
+#        x = self.drop(x)
+#        #return inputs + x  # skip connection
+#        return x
+
 
     def __call__(self, inputs):
-        x = self.normalization(inputs)  # pre normalization
+        #x = self.normalization(inputs)  # pre normalization
+        x = inputs
         x = self.seq(x)  # call LRU
-        x = self.drop(nn.gelu(x))
-        x = self.out1(x) * jax.nn.sigmoid(self.out2(x))  # GLU
+        #x = self.drop(nn.gelu(x))
+        #x = self.out1(x) * jax.nn.sigmoid(self.out2(x))  # GLU
+        #x = self.drop(self.out1(x))
+        x = nn.relu(x)
         x = self.drop(x)
-        return inputs + x  # skip connection
+        #x = self.out2(x)
+        #x = self.drop(x)
+        #return inputs + x  # skip connection
+        return x  # skip connection
 
 
 class StackedEncoderModel(nn.Module):
@@ -132,14 +158,15 @@ class StackedEncoderModel(nn.Module):
     lru: LRU
     d_model: int
     n_layers: int
+    seq_layer_class: SequenceLayer
     dropout: float = 0.0
     training: bool = True
     norm: str = "batch"
 
     def setup(self):
-        self.encoder = nn.Dense(self.d_model)
+        self.encoder = nn.Dense(self.d_model, use_bias=False)
         self.layers = [
-            SequenceLayer(
+            self.seq_layer_class(
                 lru=self.lru,
                 d_model=self.d_model,
                 dropout=self.dropout,
@@ -163,6 +190,7 @@ class ClassificationModel(nn.Module):
     d_output: int
     d_model: int
     n_layers: int
+    seq_layer_class: SequenceLayer
     dropout: float = 0.0
     training: bool = True
     pooling: str = "mean"  # pooling mode
@@ -174,11 +202,12 @@ class ClassificationModel(nn.Module):
             lru=self.lru,
             d_model=self.d_model,
             n_layers=self.n_layers,
+            seq_layer_class=self.seq_layer_class,
             dropout=self.dropout,
             training=self.training,
             norm=self.norm,
         )
-        self.decoder = nn.Dense(self.d_output * self.multidim)
+        self.decoder = nn.Dense(self.d_output * self.multidim, use_bias=False)
 
     def __call__(self, x):
         x = self.encoder(x)
@@ -193,10 +222,55 @@ class ClassificationModel(nn.Module):
             x = x.reshape(-1, self.d_output, self.multidim)
         return nn.log_softmax(x, axis=-1)
 
+class RegressionModel(nn.Module):
+    """Stacked encoder with pooling and softmax"""
+
+    lru: nn.Module
+    d_output: int
+    d_model: int
+    n_layers: int
+    seq_layer_class: SequenceLayer
+    dropout: float = 0.0
+    training: bool = True
+    norm: str = "batch"  # type of normaliztion
+    multidim: int = 1  # number of outputs
+    use_decoder: bool = True
+
+    def setup(self):
+        self.encoder = StackedEncoderModel(
+            lru=self.lru,
+            d_model=self.d_model,
+            n_layers=self.n_layers,
+            seq_layer_class=self.seq_layer_class,
+            dropout=self.dropout,
+            training=self.training,
+            norm=self.norm,
+        )
+        self.decoder = None
+        if self.use_decoder:
+            self.decoder = nn.Dense(self.d_output,
+                                    use_bias=False)
+
+    def __call__(self, x):
+        x = self.encoder(x)
+        if self.decoder:
+            x = self.decoder(x)
+        return x
+
 
 # Here we call vmap to parallelize across a batch of input sequences
 BatchClassificationModel = nn.vmap(
     ClassificationModel,
+    in_axes=0,
+    out_axes=0,
+    variable_axes={"params": None, "dropout": None,
+                   "batch_stats": None, "cache": 0, "prime": None},
+    split_rngs={"params": False, "dropout": True},
+    axis_name="batch",
+)
+
+BatchRegressionModel = nn.vmap(
+    RegressionModel,
     in_axes=0,
     out_axes=0,
     variable_axes={"params": None, "dropout": None, "batch_stats": None, "cache": 0, "prime": None},

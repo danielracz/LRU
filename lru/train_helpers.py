@@ -1,11 +1,13 @@
 from functools import partial
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.nn import one_hot
 from tqdm import tqdm
 from flax.training import train_state
 import optax
 from typing import Any
+import math
 
 
 def linear_warmup(step, base_lr, end_step, lr_min=None):
@@ -75,7 +77,9 @@ def map_nested_fn(fn):
     return map_fn
 
 
-def create_train_state(model_cls, rng, in_dim, batch_size, seq_len, weight_decay, norm, ssm_lr, lr):
+def create_train_state(model_cls, rng, in_dim, batch_size, seq_len,
+                       weight_decay_ssm, weight_decay_regular,
+                       norm, ssm_lr, lr):
     """Initializes the training state using optax"""
 
     dummy_input = jnp.ones((batch_size, seq_len, in_dim))
@@ -92,14 +96,16 @@ def create_train_state(model_cls, rng, in_dim, batch_size, seq_len, weight_decay
     ssm_fn = map_nested_fn(
         lambda k, _: "ssm"
         if k in ["nu_log", "theta_log", "gamma_log", "B_re", "B_im"]
+        #if k in ["nu_log", "theta_log", "gamma_log", "B_re", "B_im", "C_re", "D"]
         else "regular"
     )
     tx = optax.multi_transform(
         {
-            "ssm": optax.inject_hyperparams(optax.adam)(learning_rate=ssm_lr),
+            "ssm": optax.inject_hyperparams(optax.adamw)(learning_rate=ssm_lr,
+                                                         weight_decay=weight_decay_ssm),
+            #"ssm": optax.inject_hyperparams(optax.adam)(learning_rate=ssm_lr),
             "regular": optax.inject_hyperparams(optax.adamw)(
-                learning_rate=lr, weight_decay=weight_decay
-            ),
+                learning_rate=lr, weight_decay=weight_decay_regular),
         },
         ssm_fn,
     )
@@ -141,6 +147,7 @@ def create_mask(x, length):
 def cross_entropy_loss(logits, label):
     one_hot_label = jax.nn.one_hot(label, num_classes=logits.shape[0])
     return -jnp.sum(one_hot_label * logits)
+    #return jnp.sum(jnp.abs(one_hot_label - logits))
 
 
 @partial(jnp.vectorize, signature="(c),()->()")
@@ -235,20 +242,32 @@ def train_epoch(state, rng, model, trainloader, seq_len, in_dim, norm, lr_params
     Training function for an epoch that loops over batches.
     """
     model = model(training=True)  # model in training mode
+    print(jax.tree.map(jnp.shape, state.params))
+   # print(jnp.linalg.norm(state.params['encoder']['layers_0']['seq']['B_re'],
+   #                       ord=2))
     batch_losses = []
     decay_function, ssm_lr, lr, step, end_step, lr_min = lr_params
 
     for batch in tqdm(trainloader):
+        print(batch[0].shape)
+        print(batch[1].shape)
+        exit()
         inputs, labels, masks = prep_batch(batch, seq_len, in_dim)
         rng, drop_rng = jax.random.split(rng)
         state, loss = train_step(state, drop_rng, inputs, labels, masks, model, norm)
+        #B = state.params['encoder']['layers_0']['seq']['B_re']
+        #gamma = state.params['encoder']['layers_0']['seq']['gamma_log']
+        #B_norm = B * jnp.expand_dims(gamma, axis=-1)
+        #print(jnp.linalg.norm(B_norm, ord=2))
+        # print(state.params['encoder']['layers_0'].keys())
+        # print(jnp.linalg.norm(state.params['encoder']['layers_0']['out1']['kernel'], ord=jnp.inf))
         batch_losses.append(loss)  # log loss value
 
         lr_params = (decay_function, ssm_lr, lr, step, end_step, lr_min)
         state, step = update_learning_rate_per_step(lr_params, state)
 
     # Return average loss over batches
-    return state, jnp.mean(jnp.array(batch_losses)), step
+    return state, jnp.mean(jnp.array(batch_losses)), step, jnp.array(batch_losses)
 
 
 @partial(jax.jit, static_argnums=(4, 5))
@@ -262,14 +281,132 @@ def eval_step(inputs, labels, masks, state, model, norm):
     return jnp.mean(losses), accs, logits
 
 
-def validate(state, model, testloader, seq_len, in_dim, norm):
+def validate(state, model, testloader, seq_len, in_dim, norm, num_iter=None):
     """Validation function that loops over batches"""
     model = model(training=False)
     losses, accuracies = jnp.array([]), jnp.array([])
 
+    counter = 0
     for batch in tqdm(testloader):
+        batch_size = batch[0].shape[0]
+        if num_iter and counter == num_iter:
+            break
+        counter += 1
         inputs, labels, masks = prep_batch(batch, seq_len, in_dim)
         loss, acc, logits = eval_step(inputs, labels, masks, state, model, norm)
         losses = jnp.append(losses, loss)
         accuracies = jnp.append(accuracies, acc)
-    return jnp.mean(losses), jnp.mean(accuracies)
+    return jnp.mean(losses), jnp.mean(accuracies), losses
+
+@jax.jit
+def operator_norm_2(A_prev, k, A, B, C):
+    A_k = A @ A_prev
+    norm = jnp.linalg.norm(C @ A_k @ B, ord=None)**2
+    return A_k, norm
+
+@jax.jit
+def operator_norm_1(A_prev, k, A, B, C):
+    A_k = A @ A_prev
+    norm = jnp.linalg.norm(C @ A_k @ B, ord=1, axis=1)
+    return A_k, norm
+
+def get_bound_glu(state, N, K_u=1, L_l=jnp.sqrt(2).item(), K_l=1, delta=0.5,
+                  alpha=0, k_limit=1000, complex_ssms=False):
+    K_enc = jnp.linalg.norm(state.params['encoder']['encoder']['kernel'], ord=2)
+    K_dec = jnp.linalg.norm(state.params['decoder']['kernel'], ord=jnp.inf)
+    K_glu = jnp.linalg.norm(state.params['encoder']['layers_0']['out1']['kernel'],
+                            ord=jnp.inf)
+    mu, c = 1, 0
+    ssm_params = state.params['encoder']['layers_0']['seq']
+
+    A = jnp.diag(jnp.exp(-jnp.exp(ssm_params['nu_log'])))# + 1j * jnp.exp(self.theta_log))
+    B = ssm_params['B_re'] * jnp.expand_dims(jnp.exp(ssm_params['gamma_log']),
+                                            axis=-1)
+    C = ssm_params['C_re']
+    D = jnp.expand_dims(ssm_params['D'], 1)
+
+    _, traj = lax.scan(partial(operator_normprod,
+                               A=A, B=B, C=C, ord=None,
+                               pow=2),
+                       init=A,
+                       xs=jnp.arange(k_limit))
+    K_2 = jnp.sqrt(jnp.linalg.norm(D, ord='fro')**2 + jnp.sum(traj))
+    mu_block = K_2 * 16 * ((K_glu + 1)**2 + K_glu + 1) + alpha
+    mu = K_enc * mu_block * K_dec
+
+    bound = mu * K_u * L_l + K_l * jnp.sqrt(2 * jnp.log(4 / delta))
+    bound = bound / jnp.sqrt(N)
+    return bound
+
+def get_bound_relu(state, N, K_u=1, L_l=jnp.sqrt(2).item(), K_l=1, delta=0.5,
+                  alpha=0, k_limit=1000, complex_ssms=False):
+    K_enc = jnp.linalg.norm(state.params['encoder']['encoder']['kernel'], ord=2)
+    K_dec = jnp.linalg.norm(state.params['decoder']['kernel'], ord=jnp.inf)
+    K_relu = jnp.linalg.norm(state.params['encoder']['layers_0']['out1']['kernel'],
+                             ord=jnp.inf)
+    mu, c = 1, 0
+    ssm_params = state.params['encoder']['layers_0']['seq']
+
+    A = jnp.diag(jnp.exp(-jnp.exp(ssm_params['nu_log'])))# + 1j * jnp.exp(self.theta_log))
+    B = ssm_params['B_re'] * jnp.expand_dims(jnp.exp(ssm_params['gamma_log']),
+                                            axis=-1)
+    C = ssm_params['C_re']
+    D = jnp.expand_dims(ssm_params['D'], 1)
+
+    _, traj = lax.scan(partial(operator_normprod,
+                               A=A, B=B, C=C, ord=None,
+                               pow=2),
+                       init=A,
+                       xs=jnp.arange(k_limit))
+    K_2 = jnp.sqrt(jnp.linalg.norm(D, ord='fro')**2 + jnp.sum(traj))
+    mu_block = K_2 * 4 * K_relu + alpha
+    mu = K_enc * mu_block * K_dec
+
+    bound = mu * K_u * L_l + K_l * jnp.sqrt(2 * jnp.log(4 / delta))
+    bound = bound / jnp.sqrt(N)
+    return bound, K_2, K_relu
+
+def get_bound_relu_nonet(state, N, K_u=1, L_l=jnp.sqrt(2).item(), K_l=1, delta=0.5,
+                  alpha=0, k_limit=1000, complex_ssms=False):
+    metrics = {}
+    K_enc = jnp.linalg.norm(state.params['encoder']['encoder']['kernel'], ord=2)
+    K_dec = jnp.linalg.norm(state.params['decoder']['kernel'], ord=jnp.inf)
+    metrics['encoder'] = K_enc
+    metrics['decoder'] = K_dec
+    metrics['relu'] = 1
+    #K_relu = 1
+    #mu, c = 1, 0
+    use_norm_2 = True
+    for key in state.params['encoder'].keys():
+        if key != 'encoder':
+            ssm_params = state.params['encoder'][key]['seq']
+
+            A = jnp.diag(jnp.exp(-jnp.exp(ssm_params['nu_log'])))# + 1j * jnp.exp(self.theta_log))
+            B = ssm_params['B_re'] * jnp.expand_dims(jnp.exp(ssm_params['gamma_log']),
+                                                    axis=-1)
+            C = ssm_params['C_re']
+            D = jnp.expand_dims(ssm_params['D'], 1)
+
+            if use_norm_2:
+                _, traj = lax.scan(partial(operator_norm_2,
+                                           A=A, B=B, C=C),
+                                init=A,
+                                xs=jnp.arange(k_limit))
+                K = jnp.sqrt(jnp.linalg.norm(D, ord='fro')**2 + jnp.sum(traj))
+            else:
+                _, traj = lax.scan(partial(operator_norm_1,
+                                           A=A, B=B, C=C),
+                                init=A,
+                                xs=jnp.arange(k_limit))
+                K = jnp.max(jnp.linalg.norm(D, ord=1, axis=1) + traj)
+
+            #mu_block = K + alpha
+            metrics[key] = K + alpha
+            #mu = K_enc * mu_block * K_dec
+
+            use_norm_2 = False
+
+    mu = math.prod(list(metrics.values()))
+    bound = mu * K_u * L_l + K_l * jnp.sqrt(2 * jnp.log(4 / delta))
+    bound = bound / jnp.sqrt(N)
+    return bound, metrics

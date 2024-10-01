@@ -580,10 +580,60 @@ def create_copy_classification_dataset(
         TRAIN_SIZE,
     )
 
+def create_small_regression_dataset(
+    cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
+    seed: int = 42, batch_size: int = 128
+) -> ReturnType:
+    print("[*] Generating small regression dataset")
+
+    name = "smallreg"
+
+    kwargs = {"permute": False}
+
+    dataset_obj = MNIST(name, data_dir=cache_dir, **kwargs)
+    dataset_obj.setup()
+
+    trn_loader = make_data_loader(
+        dataset_obj.dataset_train, dataset_obj, seed=seed, batch_size=batch_size
+    )
+    val_loader = make_data_loader(
+        dataset_obj.dataset_val,
+        dataset_obj,
+        seed=seed,
+        batch_size=batch_size,
+        drop_last=False,
+        shuffle=False,
+    )
+    tst_loader = make_data_loader(
+        dataset_obj.dataset_test,
+        dataset_obj,
+        seed=seed,
+        batch_size=batch_size,
+        drop_last=False,
+        shuffle=False,
+    )
+
+    N_CLASSES = dataset_obj.d_output
+    SEQ_LENGTH = 28 * 28
+    IN_DIM = 1
+    TRAIN_SIZE = len(dataset_obj.dataset_train)
+    aux_loaders = {}
+    return (
+        trn_loader,
+        val_loader,
+        tst_loader,
+        aux_loaders,
+        N_CLASSES,
+        SEQ_LENGTH,
+        IN_DIM,
+        TRAIN_SIZE,
+    )
+
 
 Datasets = {
     # Other loaders.
     "mnist-classification": create_mnist_classification_dataset,
+    "small-regression": create_small_regression_dataset,
     "pmnist-classification": create_pmnist_classification_dataset,
     "cifar-classification": create_cifar_classification_dataset,
     # LRA.

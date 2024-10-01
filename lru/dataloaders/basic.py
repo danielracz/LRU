@@ -80,7 +80,7 @@ class CIFAR10(ImageResolutionSequenceDataset):
             "cutout": False,
             "rescale": None,
             "random_erasing": False,
-            "val_split": 0.01,
+            "val_split": 0.4,
             "seed": 42,  # For validation split
         }
 

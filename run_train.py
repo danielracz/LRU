@@ -3,6 +3,11 @@ from lru.train import train
 from lru.dataloading import Datasets
 import os
 
+import sys
+sys.path.append("/home/l0031@njmcs.local/nips24/minimal-LRU")
+sys.path.append("/home/l0031@njmcs.local/nips24/minimal-LRU/lru")
+sys.path.append("/home/l0031@njmcs.local/nips24/minimal-LRU/dataloaders")
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -75,7 +80,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--reduce_factor", type=float, default=1.0, help="Factor to decay lr")
     parser.add_argument("--p_dropout", type=float, default=0.1, help="Probability of dropout")
-    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay value")
+#    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay value")
+    parser.add_argument("--weight_decay_ssm", type=float, default=0.05, help="Weight decay value for ssm parameters")
+    parser.add_argument("--weight_decay_regular", type=float, default=0.05, help="Weight decay value for nonssm parameters")
+
+    parser.add_argument("--model_type", type=str, default="s4-like with relu", help="Weight decay value for nonssm parameters")
+    parser.add_argument("--alpha", type=float, default=0, help="weight of residual connection")
 
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
     train(parser.parse_args())
